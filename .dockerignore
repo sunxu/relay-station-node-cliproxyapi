@@ -21,6 +21,19 @@ logs
 conv
 config.yaml
 
+# Build and test outputs
+build
+coverage
+examples
+test
+test-output
+tmp
+*.log
+*.tmp
+*.test
+.cache
+.DS_Store
+
 # Development/editor
 bin
 .vscode
