@@ -7,14 +7,15 @@ Go 1.26+ proxy server providing OpenAI/Gemini/Claude/Codex compatible APIs with 
 
 ## Commands
 ```bash
-gofmt -w . # Format (required after Go changes)
+gofmt -w path/to/changed.go # Format only changed Go files
 go build -o cli-proxy-api ./cmd/server # Build
 go run ./cmd/server # Run dev server
 go test ./... # Run all tests
 go test -v -run TestName ./path/to/pkg # Run single test
-go build -o test-output ./cmd/server && rm test-output # Verify compile (REQUIRED after changes)
+go build -o /dev/null ./cmd/server # Verify server compilation after relevant code changes
 ```
 - Common flags: `--config <path>`, `--tui`, `--standalone`, `--local-model`, `--no-browser`, `--oauth-callback-port <port>`
+- For docs-only changes, verify content, references, and any documented commands; no full build is required. For code changes, run affected-package tests and relevant compilation checks. Changes spanning providers, shared translation, or runtime behavior need the corresponding integration/regression checks; keep required CI checks.
 
 ## Config
 - Default config: `config.yaml` (template: `config.example.yaml`)
@@ -47,7 +48,7 @@ go build -o test-output ./cmd/server && rm test-output # Verify compile (REQUIRE
 - For user-visible strings, keep the existing language used in that file/area
 - New Markdown docs should be in English unless the file is explicitly language-specific (e.g. `README_CN.md`)
 - As a rule, do not make standalone changes to `internal/translator/`. You may modify it only as part of broader changes elsewhere.
-- If a task requires changing only `internal/translator/`, run `gh repo view --json viewerPermission -q .viewerPermission` to confirm you have `WRITE`, `MAINTAIN`, or `ADMIN`. If you do, you may proceed; otherwise, file a GitHub issue including the goal, rationale, and the intended implementation code, then stop further work.
+- If a task requires changing only `internal/translator/`, run `gh repo view --json viewerPermission -q .viewerPermission` to confirm you have `WRITE`, `MAINTAIN`, or `ADMIN`. If you do, you may proceed; otherwise, prepare a sanitized issue draft with the goal, rationale, and intended implementation, and stop implementation. Publish the issue only when the user has authorized that external action.
 - `internal/runtime/executor/` should contain executors and their unit tests only. Place any helper/supporting files under `internal/runtime/executor/helps/`.
 - Follow `gofmt`; keep imports goimports-style; wrap errors with context where helpful
 - Do not use `log.Fatal`/`log.Fatalf` (terminates the process); prefer returning errors and logging via logrus
