@@ -2,6 +2,7 @@ package accountmanagementv1
 
 import (
 	"context"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"os"
@@ -123,6 +124,153 @@ func TestHeldLeaseAvoidsSelfDeadlock(t *testing.T) {
 		t.Fatal("held lease was not reused")
 	}
 	inner.Release()
+}
+
+func TestHeldLeaseOnlyReusesTheSameGate(t *testing.T) {
+	firstGate := NewGate()
+	secondGate := NewGate()
+	outer, err := firstGate.Acquire(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer outer.Release()
+	ctx := WithHeldLease(context.Background(), outer)
+
+	inner, err := secondGate.Acquire(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if inner == outer {
+		t.Fatal("held lease from another gate was reused")
+	}
+	inner.Release()
+}
+
+func TestGateGrantCancellationRaceDoesNotStrandGate(t *testing.T) {
+	const iterations = 1200
+	for i := 0; i < iterations; i++ {
+		g := NewGate()
+		holder, err := g.Acquire(context.Background())
+		if err != nil {
+			t.Fatal(err)
+		}
+		ctx, cancel := context.WithCancel(context.Background())
+		result := make(chan struct {
+			lease *Lease
+			err   error
+		}, 1)
+		go func() {
+			lease, acquireErr := g.Acquire(ctx)
+			result <- struct {
+				lease *Lease
+				err   error
+			}{lease: lease, err: acquireErr}
+		}()
+		waitForGateQueue(t, g, 1)
+
+		start := make(chan struct{})
+		go func() {
+			<-start
+			holder.Release()
+		}()
+		go func() {
+			<-start
+			cancel()
+		}()
+		close(start)
+
+		r := <-result
+		if r.err != nil && !errors.Is(r.err, ErrGateCanceled) {
+			t.Fatalf("iteration %d: acquire err=%v", i, r.err)
+		}
+		if r.lease != nil {
+			r.lease.Release()
+		}
+
+		probeCtx, probeCancel := context.WithTimeout(context.Background(), time.Second)
+		probe, probeErr := g.Acquire(probeCtx)
+		probeCancel()
+		if probeErr != nil {
+			t.Fatalf("iteration %d: gate stranded: %v", i, probeErr)
+		}
+		probe.Release()
+	}
+}
+
+func TestGateRejectsPreCanceledContext(t *testing.T) {
+	g := NewGate()
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	if lease, err := g.Acquire(ctx); lease != nil || !errors.Is(err, ErrGateCanceled) {
+		t.Fatalf("pre-canceled acquire lease=%v err=%v", lease, err)
+	}
+}
+
+func TestDispatchFenceDurableAcrossStoreRestartAndNeverGCs(t *testing.T) {
+	dir := t.TempDir()
+	store, err := NewDispatchFenceStore(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	first := "01234567-89ab-4cde-8fab-0123456789ab"
+	second := "fedcba98-7654-4321-8fed-cba987654321"
+	if fenced, err := store.IsFenced(first); err != nil || fenced {
+		t.Fatalf("new token fenced=%v err=%v", fenced, err)
+	}
+	if err := store.Fence(first); err != nil {
+		t.Fatal(err)
+	}
+	if err := store.Fence(first); err != nil {
+		t.Fatalf("idempotent fence: %v", err)
+	}
+	if err := store.Fence(second); err != nil {
+		t.Fatal(err)
+	}
+
+	restarted, err := NewDispatchFenceStore(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if info, statErr := os.Stat(restarted.Directory()); statErr != nil {
+		t.Fatal(statErr)
+	} else if info.Mode().Perm() != 0o700 {
+		t.Fatalf("fence directory mode=%o, want 700", info.Mode().Perm())
+	}
+	for _, token := range []string{first, second} {
+		fenced, fenceErr := restarted.IsFenced(token)
+		if fenceErr != nil || !fenced {
+			t.Fatalf("token %s after restart fenced=%v err=%v", token, fenced, fenceErr)
+		}
+		info, statErr := os.Stat(filepath.Join(restarted.Directory(), token))
+		if statErr != nil {
+			t.Fatal(statErr)
+		}
+		if info.Mode().Perm() != 0o600 {
+			t.Fatalf("token %s mode=%o, want 600", token, info.Mode().Perm())
+		}
+		raw, readErr := os.ReadFile(filepath.Join(restarted.Directory(), token))
+		if readErr != nil || string(raw) != token {
+			t.Fatalf("token %s content=%q err=%v", token, raw, readErr)
+		}
+	}
+	if err := restarted.RequireUnfenced(first); !errors.Is(err, ErrDispatchFenced) {
+		t.Fatalf("fenced admission err=%v, want ErrDispatchFenced", err)
+	}
+	if err := restarted.RequireUnfenced("01234567-89ab-4cde-8fab-0123456789ac"); err != nil {
+		t.Fatalf("unfenced admission: %v", err)
+	}
+	entries, err := os.ReadDir(restarted.Directory())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(entries) != 2 {
+		t.Fatalf("fence count=%d, want 2 without GC", len(entries))
+	}
+	for _, invalid := range []string{"01234567-89AB-4cde-8fab-0123456789ab", "0123456789abcdef0123456789abcdef0123"} {
+		if err := restarted.Fence(invalid); !errors.Is(err, ErrInvalidDispatch) {
+			t.Fatalf("invalid token %q err=%v", invalid, err)
+		}
+	}
 }
 
 func TestSidecarProvisionWriteRefreshDelete(t *testing.T) {
@@ -362,6 +510,56 @@ func TestTokenEncodings(t *testing.T) {
 	}
 	if !ConstantTimeEqual(pt, pt) || ConstantTimeEqual(pt, pt+"x") {
 		t.Fatal("constant-time equality result incorrect")
+	}
+}
+
+func TestTargetAndPostconditionGoldenVectors(t *testing.T) {
+	const (
+		absentCanonical  = "72656c61792d73746174696f6e2f6e6f64652d6163636f756e742d7461726765742d707265636f6e646974696f6e2f763100000006616273656e740000000b616e7469677261766974790000000d75406578616d706c652e636f6d00000000000000000000000000000000"
+		absentToken      = "pt1:yjr-kivbnszxEXRk151SlZyfKAzDmrJAqsGL0d3CSrA"
+		presentCanonical = "72656c61792d73746174696f6e2f6e6f64652d6163636f756e742d7461726765742d707265636f6e646974696f6e2f76310000000770726573656e740000000b616e7469677261766974790000000d75406578616d706c652e636f6d0000002430303030303030302d303030302d343030302d383030302d3030303030303030303030310000001e616e7469677261766974792d75406578616d706c652e636f6d2e6a736f6e0000000972756e74696d652d3100000020e265b6f564601a1fe8dc42785cd18a868bd8013eb5899560e79248767a683e6b"
+		presentToken     = "pt1:sr-6kxyu4M13TNW-Arj2HEh3vZ2qeWKyAiE4lfAcEMA"
+		pcCanonical      = "72656c61792d73746174696f6e2f6e6f64652d6163636f756e742d706f7374636f6e646974696f6e2f76310000002430303030303030302d303030302d343030302d383030302d3030303030303030303030310000000b616e7469677261766974790000000d75406578616d706c652e636f6d0000001e616e7469677261766974792d75406578616d706c652e636f6d2e6a736f6e00000020e265b6f564601a1fe8dc42785cd18a868bd8013eb5899560e79248767a683e6b00000010000102030405060708090a0b0c0d0e0f"
+		pcToken          = "pc1:36l9PpOU6K8EBm2eLzpvWG60UmovVwxm_baDBp2XWmU"
+		incarnation      = "00000000-0000-4000-8000-000000000001"
+		filename         = "antigravity-u@example.com.json"
+		writeToken       = "wt1:AAECAwQFBgcICQoLDA0ODw"
+	)
+
+	absent, err := canonicalTargetPrecondition("absent", "antigravity", "u@example.com", "", "", "", nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := hex.EncodeToString(absent); got != absentCanonical {
+		t.Fatalf("absent canonical=%s", got)
+	}
+	absentEncoded, err := EncodeTargetPrecondition("absent", "antigravity", "u@example.com", "", "", "", nil)
+	if err != nil || absentEncoded != absentToken {
+		t.Fatalf("absent token=%s err=%v", absentEncoded, err)
+	}
+
+	present, err := canonicalTargetPrecondition("present", "antigravity", "u@example.com", incarnation, filename, "runtime-1", []byte("credential"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := hex.EncodeToString(present); got != presentCanonical {
+		t.Fatalf("present canonical=%s", got)
+	}
+	presentEncoded, err := EncodeTargetPrecondition("present", "antigravity", "u@example.com", incarnation, filename, "runtime-1", []byte("credential"))
+	if err != nil || presentEncoded != presentToken {
+		t.Fatalf("present token=%s err=%v", presentEncoded, err)
+	}
+
+	pc, err := canonicalPostcondition(incarnation, "antigravity", "u@example.com", filename, []byte("credential"), writeToken)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := hex.EncodeToString(pc); got != pcCanonical {
+		t.Fatalf("pc canonical=%s", got)
+	}
+	pcEncoded, err := EncodePostcondition(incarnation, "antigravity", "u@example.com", filename, []byte("credential"), writeToken)
+	if err != nil || pcEncoded != pcToken {
+		t.Fatalf("pc token=%s err=%v", pcEncoded, err)
 	}
 }
 

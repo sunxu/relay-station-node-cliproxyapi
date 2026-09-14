@@ -61,7 +61,7 @@ func (h *Handler) UploadAuthFile(c *gin.Context) {
 		return
 	}
 	if len(fileHeaders) == 1 {
-		if uploadedAuthFileIsAntigravity(fileHeaders[0]) {
+		if h.accountMutationV1OwnershipActive() && uploadedAuthFileIsAntigravity(fileHeaders[0]) {
 			writeLegacyAccountMutationV1Required(c)
 			return
 		}
@@ -77,10 +77,12 @@ func (h *Handler) UploadAuthFile(c *gin.Context) {
 		return
 	}
 	if len(fileHeaders) > 1 {
-		for _, file := range fileHeaders {
-			if uploadedAuthFileIsAntigravity(file) {
-				writeLegacyAccountMutationV1Required(c)
-				return
+		if h.accountMutationV1OwnershipActive() {
+			for _, file := range fileHeaders {
+				if uploadedAuthFileIsAntigravity(file) {
+					writeLegacyAccountMutationV1Required(c)
+					return
+				}
 			}
 		}
 		uploaded := make([]string, 0, len(fileHeaders))
@@ -131,7 +133,7 @@ func (h *Handler) UploadAuthFile(c *gin.Context) {
 		c.JSON(400, gin.H{"error": "failed to read body"})
 		return
 	}
-	if authFileDataIsAntigravity(data) {
+	if h.accountMutationV1OwnershipActive() && authFileDataIsAntigravity(data) {
 		writeLegacyAccountMutationV1Required(c)
 		return
 	}
@@ -156,7 +158,7 @@ func (h *Handler) DeleteAuthFile(c *gin.Context) {
 			return
 		}
 		for _, entry := range entries {
-			if !entry.IsDir() && strings.HasSuffix(strings.ToLower(entry.Name()), ".json") && h.authFileNameIsAntigravity(entry.Name()) {
+			if h.accountMutationV1OwnershipActive() && !entry.IsDir() && strings.HasSuffix(strings.ToLower(entry.Name()), ".json") && h.authFileNameIsAntigravity(entry.Name()) {
 				writeLegacyAccountMutationV1Required(c)
 				return
 			}
@@ -198,10 +200,12 @@ func (h *Handler) DeleteAuthFile(c *gin.Context) {
 		c.JSON(400, gin.H{"error": "invalid name"})
 		return
 	}
-	for _, name := range names {
-		if h.authFileNameIsAntigravity(name) {
-			writeLegacyAccountMutationV1Required(c)
-			return
+	if h.accountMutationV1OwnershipActive() {
+		for _, name := range names {
+			if h.authFileNameIsAntigravity(name) {
+				writeLegacyAccountMutationV1Required(c)
+				return
+			}
 		}
 	}
 	if len(names) == 1 {
