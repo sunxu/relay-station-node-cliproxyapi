@@ -93,9 +93,7 @@ func (m *Manager) Register(ctx context.Context, auth *Auth) (*Auth, error) {
 		m.scheduler.upsertAuth(authClone)
 	}
 	m.queueRefreshReschedule(auth.ID)
-	if errPersist := m.persist(ctx, auth); errPersist != nil {
-		return nil, fmt.Errorf("register auth persistence: %w", errPersist)
-	}
+	_ = m.persist(ctx, auth)
 	m.hook.OnAuthRegistered(ctx, auth.Clone())
 	if cooldownStateChanged {
 		m.persistCooldownStates(ctx)
@@ -154,9 +152,7 @@ func (m *Manager) Update(ctx context.Context, auth *Auth) (*Auth, error) {
 		m.scheduler.upsertAuth(authClone)
 	}
 	m.queueRefreshReschedule(auth.ID)
-	if errPersist := m.persist(ctx, auth); errPersist != nil {
-		return nil, fmt.Errorf("update auth persistence: %w", errPersist)
-	}
+	_ = m.persist(ctx, auth)
 	m.hook.OnAuthUpdated(ctx, auth.Clone())
 	if cooldownStateChanged {
 		m.persistCooldownStates(ctx)

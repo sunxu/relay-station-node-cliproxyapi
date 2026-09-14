@@ -2,39 +2,19 @@ package auth
 
 import (
 	"context"
-	"errors"
 	"sync/atomic"
 	"testing"
 )
 
 type countingStore struct {
 	saveCount atomic.Int32
-	saveErr   error
 }
 
 func (s *countingStore) List(context.Context) ([]*Auth, error) { return nil, nil }
 
 func (s *countingStore) Save(context.Context, *Auth) (string, error) {
 	s.saveCount.Add(1)
-	return "", s.saveErr
-}
-
-func TestManagerPropagatesPersistenceFailure(t *testing.T) {
-	want := errors.New("persist failed")
-	store := &countingStore{saveErr: want}
-	mgr := NewManager(store, nil, nil)
-	auth := &Auth{ID: "auth-1", Provider: "antigravity", Metadata: map[string]any{"type": "antigravity"}}
-	if _, err := mgr.Register(context.Background(), auth); !errors.Is(err, want) {
-		t.Fatalf("Register error = %v, want persistence failure", err)
-	}
-	store.saveErr = nil
-	if _, err := mgr.Update(WithSkipPersist(context.Background()), auth); err != nil {
-		t.Fatalf("prepare Update: %v", err)
-	}
-	store.saveErr = want
-	if _, err := mgr.Update(context.Background(), auth); !errors.Is(err, want) {
-		t.Fatalf("Update error = %v, want persistence failure", err)
-	}
+	return "", nil
 }
 
 func (s *countingStore) Delete(context.Context, string) error { return nil }

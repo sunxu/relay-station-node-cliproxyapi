@@ -451,7 +451,7 @@ func (h *Handler) RequestAntigravityToken(c *gin.Context) {
 		if accessToken != "" {
 			fetchedProjectID, errProject := authSvc.FetchProjectID(ctx, accessToken)
 			if errProject != nil {
-				log.Warn("antigravity: failed to fetch project ID")
+				log.Warnf("antigravity: failed to fetch project ID: %v", errProject)
 			} else {
 				projectID = fetchedProjectID
 				log.Infof("antigravity: obtained project ID %s", util.HideAPIKey(projectID))
@@ -490,15 +490,15 @@ func (h *Handler) RequestAntigravityToken(c *gin.Context) {
 		if errGuard := guardOAuthSessionPendingForSave(state, "antigravity"); errGuard != nil {
 			return
 		}
-		_, errSave := h.saveTokenRecord(ctx, record)
+		savedPath, errSave := h.saveTokenRecord(ctx, record)
 		if errSave != nil {
-			log.Error("Failed to persist Antigravity credential")
+			log.Errorf("Failed to save token to file: %v", errSave)
 			SetOAuthSessionError(state, "Failed to save token to file")
 			return
 		}
 
 		CompleteOAuthSession(state)
-		fmt.Println("Authentication successful! Antigravity credential persisted")
+		fmt.Printf("Authentication successful! Token saved to %s\n", savedPath)
 		if projectID != "" {
 			fmt.Printf("Using GCP project: %s\n", util.HideAPIKey(projectID))
 		}
