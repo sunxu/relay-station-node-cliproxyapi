@@ -3,6 +3,7 @@ package auth
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io/fs"
 	"net/http"
@@ -14,6 +15,7 @@ import (
 	"sync/atomic"
 	"time"
 
+	accountv1 "github.com/router-for-me/CLIProxyAPI/v7/internal/accountmanagementv1"
 	cliproxyauth "github.com/router-for-me/CLIProxyAPI/v7/sdk/cliproxy/auth"
 	"github.com/router-for-me/CLIProxyAPI/v7/sdk/pluginapi"
 )
@@ -90,6 +92,31 @@ func (s *FileTokenStore) Save(ctx context.Context, auth *cliproxyauth.Auth) (str
 		return "", fmt.Errorf("auth filestore: missing file path attribute for %s", auth.ID)
 	}
 
+	coord, release, err := s.acquireNativeWriter(ctx, path, isAntigravityAuth(auth))
+	if err != nil {
+		return "", err
+	}
+	if release != nil {
+		defer release()
+	}
+	existedBefore := false
+	if coord != nil && isAntigravityAuth(auth) {
+		if _, statErr := os.Stat(path); statErr == nil {
+			existedBefore = true
+			marker, loadErr := coord.Bookkeeping().Load(filepath.Base(path))
+			if errors.Is(loadErr, os.ErrNotExist) {
+				marker, loadErr = coord.Bookkeeping().Provision(filepath.Base(path), "antigravity", authEmail(auth))
+			}
+			if loadErr != nil || marker == nil || !strings.EqualFold(marker.Provider, "antigravity") || !strings.EqualFold(marker.NormalizedEmail, strings.TrimSpace(authEmail(auth))) {
+				return "", fmt.Errorf("auth filestore: target metadata unavailable")
+			}
+		} else if !os.IsNotExist(statErr) {
+			return "", fmt.Errorf("auth filestore: stat credential failed: %w", statErr)
+		} else if deleteErr := coord.Bookkeeping().Delete(filepath.Base(path)); deleteErr != nil {
+			return "", fmt.Errorf("auth filestore: clear orphan marker failed: %w", deleteErr)
+		}
+	}
+
 	if auth.Disabled {
 		if _, statErr := os.Stat(path); os.IsNotExist(statErr) {
 			return "", nil
@@ -151,6 +178,23 @@ func (s *FileTokenStore) Save(ctx context.Context, auth *cliproxyauth.Auth) (str
 	default:
 		return "", fmt.Errorf("auth filestore: nothing to persist for %s", auth.ID)
 	}
+	if coord != nil && isAntigravityAuth(auth) {
+		content, readErr := os.ReadFile(path)
+		if readErr != nil {
+			return "", fmt.Errorf("auth filestore: read persisted credential failed: %w", readErr)
+		}
+		if _, statErr := os.Stat(path); statErr != nil {
+			return "", fmt.Errorf("auth filestore: stat persisted credential failed: %w", statErr)
+		}
+		if !existedBefore {
+			if _, provisionErr := coord.Bookkeeping().Provision(filepath.Base(path), "antigravity", authEmail(auth)); provisionErr != nil {
+				return "", fmt.Errorf("auth filestore: provision marker failed: %w", provisionErr)
+			}
+		}
+		if _, refreshErr := coord.Bookkeeping().RecordNativeRefresh(filepath.Base(path), content); refreshErr != nil {
+			return "", fmt.Errorf("auth filestore: record native refresh failed: %w", refreshErr)
+		}
+	}
 
 	if auth.Attributes == nil {
 		auth.Attributes = make(map[string]string)
@@ -208,10 +252,104 @@ func (s *FileTokenStore) Delete(ctx context.Context, id string) error {
 	if err != nil {
 		return err
 	}
+	coord, release, err := s.acquireNativeWriter(ctx, path, s.isAntigravityPath(path))
+	if err != nil {
+		return err
+	}
+	if release != nil {
+		defer release()
+	}
 	if err = os.Remove(path); err != nil && !os.IsNotExist(err) {
 		return fmt.Errorf("auth filestore: delete failed: %w", err)
 	}
+	if coord != nil {
+		filename := filepath.Base(path)
+		if marker, loadErr := coord.Bookkeeping().Load(filename); loadErr == nil && strings.EqualFold(marker.Provider, "antigravity") {
+			if deleteErr := coord.Bookkeeping().Delete(filename); deleteErr != nil {
+				return fmt.Errorf("auth filestore: delete marker failed: %w", deleteErr)
+			}
+		}
+	}
 	return nil
+}
+
+func (s *FileTokenStore) isAntigravityPath(path string) bool {
+	if strings.HasPrefix(strings.ToLower(filepath.Base(path)), "antigravity-") || strings.EqualFold(filepath.Base(path), "antigravity.json") {
+		return true
+	}
+	if raw, err := os.ReadFile(path); err == nil {
+		var metadata map[string]any
+		if json.Unmarshal(raw, &metadata) == nil {
+			provider, _ := metadata["type"].(string)
+			if strings.EqualFold(strings.TrimSpace(provider), "antigravity") {
+				return true
+			}
+		}
+	}
+	coord, ok := accountv1.LookupAuthDir(filepath.Dir(path))
+	if !ok || coord == nil {
+		return false
+	}
+	marker, err := coord.Bookkeeping().Load(filepath.Base(path))
+	return err == nil && strings.EqualFold(marker.Provider, "antigravity")
+}
+
+func (s *FileTokenStore) acquireNativeWriter(ctx context.Context, path string, antigravity bool) (*accountv1.Coordinator, func(), error) {
+	if !antigravity {
+		return nil, nil, nil
+	}
+	dir := s.baseDirSnapshot()
+	if dir == "" {
+		dir = filepath.Dir(path)
+	}
+	coord, err := accountv1.ForAuthDir(dir)
+	if err != nil {
+		return nil, nil, err
+	}
+	canonicalPath, err := filepath.Abs(filepath.Clean(path))
+	if err != nil || filepath.Dir(canonicalPath) != coord.AuthDir() {
+		return nil, nil, fmt.Errorf("auth filestore: Antigravity target is outside the configured auth directory")
+	}
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	if accountv1.HeldLease(ctx) != nil {
+		return coord, nil, nil
+	}
+	lease, err := coord.Gate().Acquire(ctx)
+	if err != nil {
+		return nil, nil, err
+	}
+	return coord, lease.Release, nil
+}
+
+func isAntigravityAuth(auth *cliproxyauth.Auth) bool {
+	if auth == nil {
+		return false
+	}
+	if strings.EqualFold(strings.TrimSpace(auth.Provider), "antigravity") {
+		return true
+	}
+	if auth.Metadata != nil {
+		provider, _ := auth.Metadata["type"].(string)
+		return strings.EqualFold(strings.TrimSpace(provider), "antigravity")
+	}
+	return false
+}
+
+func authEmail(auth *cliproxyauth.Auth) string {
+	if auth == nil {
+		return ""
+	}
+	if auth.Metadata != nil {
+		if email, ok := auth.Metadata["email"].(string); ok && strings.TrimSpace(email) != "" {
+			return email
+		}
+	}
+	if auth.Attributes != nil {
+		return auth.Attributes["email"]
+	}
+	return ""
 }
 
 func (s *FileTokenStore) resolveDeletePath(id string) (string, error) {
@@ -308,13 +446,10 @@ func (s *FileTokenStore) readAuthFiles(path, baseDir string) ([]*cliproxyauth.Au
 			if accessToken != "" {
 				fetchedProjectID, errFetch := FetchAntigravityProjectID(context.Background(), accessToken, http.DefaultClient)
 				if errFetch == nil && strings.TrimSpace(fetchedProjectID) != "" {
+					// Loading/watching a credential is not an auth-file writer. Keep
+					// the discovered project id in this runtime projection and leave
+					// durable updates to the gated persistence path.
 					metadata["project_id"] = strings.TrimSpace(fetchedProjectID)
-					if raw, errMarshal := json.Marshal(metadata); errMarshal == nil {
-						if file, errOpen := os.OpenFile(path, os.O_WRONLY|os.O_TRUNC, 0o600); errOpen == nil {
-							_, _ = file.Write(raw)
-							_ = file.Close()
-						}
-					}
 				}
 			}
 		}

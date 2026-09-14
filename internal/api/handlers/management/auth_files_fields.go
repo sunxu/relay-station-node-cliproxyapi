@@ -55,6 +55,10 @@ func (h *Handler) PatchAuthFileStatus(c *gin.Context) {
 		c.JSON(http.StatusNotFound, gin.H{"error": "auth file not found"})
 		return
 	}
+	if strings.EqualFold(strings.TrimSpace(targetAuth.Provider), "antigravity") {
+		writeLegacyAccountMutationV1Required(c)
+		return
+	}
 	if coreauth.IsPluginVirtualAuth(targetAuth) {
 		// Allow status changes only when targeting the source auth file name, matching delete semantics.
 		// Expanded virtual project auths still cannot be modified independently.
@@ -266,6 +270,10 @@ func (h *Handler) PatchAuthFileFields(c *gin.Context) {
 
 	if targetAuth == nil {
 		c.JSON(http.StatusNotFound, gin.H{"error": "auth file not found"})
+		return
+	}
+	if strings.EqualFold(strings.TrimSpace(targetAuth.Provider), "antigravity") {
+		writeLegacyAccountMutationV1Required(c)
 		return
 	}
 	if coreauth.IsPluginVirtualAuth(targetAuth) {

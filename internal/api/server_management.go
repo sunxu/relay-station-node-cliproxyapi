@@ -27,6 +27,20 @@ func (s *Server) registerManagementRoutes() {
 	mgmt := s.engine.Group("/v0/management")
 	mgmt.Use(s.managementAvailabilityMiddleware(), s.mgmt.Middleware())
 	{
+		// Stage 7N routes reuse the management key verifier through their frozen
+		// Bearer-only authentication middleware.
+		v1Mgmt := s.engine.Group("/v0/management")
+		v1Mgmt.Use(s.managementAvailabilityMiddleware(), s.mgmt.V1BearerOnlyMiddleware())
+		{
+			v1Mgmt.GET("/account-contract/v1", s.mgmt.GetAccountContractV1)
+			v1Mgmt.POST("/account-targets/v1/resolve", s.mgmt.ResolveAccountTargetV1)
+			v1Mgmt.POST("/account-mutations/v1/disable", s.mgmt.DisableAccountV1)
+			v1Mgmt.POST("/account-mutations/v1/enable", s.mgmt.EnableAccountV1)
+			v1Mgmt.POST("/account-mutations/v1/remove", s.mgmt.RemoveAccountV1)
+			v1Mgmt.POST("/account-mutations/v1/create", s.mgmt.CreateAccountV1)
+			v1Mgmt.POST("/account-mutations/v1/replace", s.mgmt.ReplaceAccountV1)
+		}
+
 		mgmt.GET("/config", s.mgmt.GetConfig)
 		mgmt.GET("/config.yaml", s.mgmt.GetConfigYAML)
 		mgmt.PUT("/config.yaml", s.mgmt.PutConfigYAML)

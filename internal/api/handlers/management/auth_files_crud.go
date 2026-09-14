@@ -61,6 +61,10 @@ func (h *Handler) UploadAuthFile(c *gin.Context) {
 		return
 	}
 	if len(fileHeaders) == 1 {
+		if uploadedAuthFileIsAntigravity(fileHeaders[0]) {
+			writeLegacyAccountMutationV1Required(c)
+			return
+		}
 		if _, errUpload := h.storeUploadedAuthFile(ctx, fileHeaders[0]); errUpload != nil {
 			if errors.Is(errUpload, errAuthFileMustBeJSON) {
 				c.JSON(http.StatusBadRequest, gin.H{"error": "file must be .json"})
@@ -73,6 +77,12 @@ func (h *Handler) UploadAuthFile(c *gin.Context) {
 		return
 	}
 	if len(fileHeaders) > 1 {
+		for _, file := range fileHeaders {
+			if uploadedAuthFileIsAntigravity(file) {
+				writeLegacyAccountMutationV1Required(c)
+				return
+			}
+		}
 		uploaded := make([]string, 0, len(fileHeaders))
 		failed := make([]gin.H, 0)
 		for _, file := range fileHeaders {
@@ -121,6 +131,10 @@ func (h *Handler) UploadAuthFile(c *gin.Context) {
 		c.JSON(400, gin.H{"error": "failed to read body"})
 		return
 	}
+	if authFileDataIsAntigravity(data) {
+		writeLegacyAccountMutationV1Required(c)
+		return
+	}
 	if err = h.writeAuthFile(ctx, filepath.Base(name), data); err != nil {
 		c.JSON(500, gin.H{"error": err.Error()})
 		return
@@ -140,6 +154,12 @@ func (h *Handler) DeleteAuthFile(c *gin.Context) {
 		if err != nil {
 			c.JSON(500, gin.H{"error": fmt.Sprintf("failed to read auth dir: %v", err)})
 			return
+		}
+		for _, entry := range entries {
+			if !entry.IsDir() && strings.HasSuffix(strings.ToLower(entry.Name()), ".json") && h.authFileNameIsAntigravity(entry.Name()) {
+				writeLegacyAccountMutationV1Required(c)
+				return
+			}
 		}
 		deleted := 0
 		for _, e := range entries {
@@ -178,6 +198,12 @@ func (h *Handler) DeleteAuthFile(c *gin.Context) {
 		c.JSON(400, gin.H{"error": "invalid name"})
 		return
 	}
+	for _, name := range names {
+		if h.authFileNameIsAntigravity(name) {
+			writeLegacyAccountMutationV1Required(c)
+			return
+		}
+	}
 	if len(names) == 1 {
 		if _, status, errDelete := h.deleteAuthFileByName(ctx, names[0]); errDelete != nil {
 			c.JSON(status, gin.H{"error": errDelete.Error()})
@@ -207,6 +233,45 @@ func (h *Handler) DeleteAuthFile(c *gin.Context) {
 		return
 	}
 	c.JSON(http.StatusOK, gin.H{"status": "ok", "deleted": len(deletedFiles), "files": deletedFiles})
+}
+
+func uploadedAuthFileIsAntigravity(file *multipart.FileHeader) bool {
+	if file == nil {
+		return false
+	}
+	source, err := file.Open()
+	if err != nil {
+		return false
+	}
+	defer source.Close()
+	// The legacy route historically accepts files larger than the v1 upload
+	// limit. Read the same complete payload that the legacy writer would consume
+	// so an Antigravity type placed late in JSON cannot bypass v1 ownership.
+	raw, err := io.ReadAll(source)
+	return err == nil && authFileDataIsAntigravity(raw)
+}
+
+func authFileDataIsAntigravity(raw []byte) bool {
+	var metadata struct {
+		Type string `json:"type"`
+	}
+	return json.Unmarshal(raw, &metadata) == nil && strings.EqualFold(strings.TrimSpace(metadata.Type), "antigravity")
+}
+
+func (h *Handler) authFileNameIsAntigravity(name string) bool {
+	if h == nil || h.cfg == nil || isUnsafeAuthFileName(name) {
+		return false
+	}
+	base := filepath.Base(name)
+	if strings.HasPrefix(strings.ToLower(base), "antigravity-") || strings.EqualFold(base, "antigravity.json") {
+		return true
+	}
+	raw, err := os.ReadFile(filepath.Join(h.cfg.AuthDir, base))
+	return err == nil && authFileDataIsAntigravity(raw)
+}
+
+func writeLegacyAccountMutationV1Required(c *gin.Context) {
+	writeAccountV1Error(c, http.StatusConflict, accountMutationV1RequiredError, "Antigravity account mutations require Account Management Contract v1")
 }
 
 func (h *Handler) multipartAuthFileHeaders(c *gin.Context) ([]*multipart.FileHeader, error) {
