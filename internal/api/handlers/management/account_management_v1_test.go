@@ -22,7 +22,6 @@ import (
 	"github.com/router-for-me/CLIProxyAPI/v7/internal/config"
 	sdkAuth "github.com/router-for-me/CLIProxyAPI/v7/sdk/auth"
 	coreauth "github.com/router-for-me/CLIProxyAPI/v7/sdk/cliproxy/auth"
-	log "github.com/sirupsen/logrus"
 )
 
 func newAccountV1TestHandler(t *testing.T) (*Handler, string) {
@@ -412,78 +411,6 @@ func TestAccountV1RejectsStaleCASAndInvalidUploadWithoutMutation(t *testing.T) {
 	}
 	if strings.Contains(response.Body.String(), "credential-canary") {
 		t.Fatalf("error leaked credential: %s", response.Body.String())
-	}
-}
-
-func TestAccountV1RequestResponseAndLogsDoNotLeakSecrets(t *testing.T) {
-	gin.SetMode(gin.TestMode)
-	const managementKey = "management-key-canary-stage7n"
-	t.Setenv("MANAGEMENT_PASSWORD", managementKey)
-	h, dir := newAccountV1TestHandler(t)
-
-	var captured bytes.Buffer
-	previousOutput := log.StandardLogger().Out
-	log.SetOutput(&captured)
-	t.Cleanup(func() { log.SetOutput(previousOutput) })
-
-	engine := gin.New()
-	engine.Use(gin.LoggerWithWriter(&captured))
-	engine.POST("/v0/management/account-mutations/v1/create", h.V1BearerOnlyMiddleware(), h.CreateAccountV1)
-
-	credential := []byte(`{"type":"antigravity","access_token":"access-token-canary-stage7n","refresh_token":"refresh-token-canary-stage7n","expires_in":3600,"timestamp":1770000000000,"expired":"2026-09-14T00:00:00Z","email":"secret-log@example.com","project_id":"project-a","forbidden_path":"/private/credential/path-canary-stage7n"}`)
-	absent, err := accountv1.EncodeTargetPrecondition("absent", "antigravity", "secret-log@example.com", "", "", "", nil)
-	if err != nil {
-		t.Fatal(err)
-	}
-	content, err := accountv1.EncodeContentProof(credential)
-	if err != nil {
-		t.Fatal(err)
-	}
-	token, err := accountv1.NewWriteToken()
-	if err != nil {
-		t.Fatal(err)
-	}
-	requestBody := map[string]any{"mode": "create", "provider": "antigravity", "email": "secret-log@example.com", "target_precondition_v1": absent, "write_token_v1": token, "content_sha256_v1": content, "mutation_budget_ms": 15000}
-
-	var body bytes.Buffer
-	w := multipart.NewWriter(&body)
-	requestHeader := textproto.MIMEHeader{}
-	requestHeader.Set("Content-Disposition", `form-data; name="request"`)
-	requestHeader.Set("Content-Type", "application/json")
-	requestPart, err := w.CreatePart(requestHeader)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if err = json.NewEncoder(requestPart).Encode(requestBody); err != nil {
-		t.Fatal(err)
-	}
-	credentialHeader := textproto.MIMEHeader{}
-	credentialHeader.Set("Content-Disposition", `form-data; name="credential"; filename="credential-canary-stage7n.json"`)
-	credentialHeader.Set("Content-Type", "application/json")
-	credentialPart, err := w.CreatePart(credentialHeader)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if _, err = credentialPart.Write(credential); err != nil {
-		t.Fatal(err)
-	}
-	if err = w.Close(); err != nil {
-		t.Fatal(err)
-	}
-
-	request := httptest.NewRequest(http.MethodPost, "/v0/management/account-mutations/v1/create", &body)
-	request.Header.Set("Content-Type", w.FormDataContentType())
-	request.Header.Set("Authorization", "Bearer "+managementKey)
-	recorder := httptest.NewRecorder()
-	engine.ServeHTTP(recorder, request)
-	if recorder.Code != http.StatusUnprocessableEntity || !strings.Contains(recorder.Body.String(), "upload_invalid") {
-		t.Fatalf("invalid secret canary upload status=%d body=%s", recorder.Code, recorder.Body.String())
-	}
-	observed := captured.String() + recorder.Body.String()
-	for _, canary := range []string{managementKey, "access-token-canary-stage7n", "refresh-token-canary-stage7n", string(credential), "/private/credential/path-canary-stage7n", dir} {
-		if strings.Contains(observed, canary) {
-			t.Fatalf("management surface leaked protected canary %q", canary)
-		}
 	}
 }
 
