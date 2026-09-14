@@ -55,7 +55,7 @@ func (h *Handler) PatchAuthFileStatus(c *gin.Context) {
 		c.JSON(http.StatusNotFound, gin.H{"error": "auth file not found"})
 		return
 	}
-	if h.accountMutationV1OwnershipActive() && strings.EqualFold(strings.TrimSpace(targetAuth.Provider), "antigravity") {
+	if strings.EqualFold(strings.TrimSpace(targetAuth.Provider), "antigravity") {
 		writeLegacyAccountMutationV1Required(c)
 		return
 	}
@@ -272,7 +272,7 @@ func (h *Handler) PatchAuthFileFields(c *gin.Context) {
 		c.JSON(http.StatusNotFound, gin.H{"error": "auth file not found"})
 		return
 	}
-	if h.accountMutationV1OwnershipActive() && strings.EqualFold(strings.TrimSpace(targetAuth.Provider), "antigravity") {
+	if strings.EqualFold(strings.TrimSpace(targetAuth.Provider), "antigravity") {
 		writeLegacyAccountMutationV1Required(c)
 		return
 	}

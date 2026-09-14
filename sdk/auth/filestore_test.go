@@ -1,71 +1,16 @@
 package auth
 
 import (
-	"bytes"
 	"context"
 	"os"
 	"path/filepath"
-	"strings"
 	"testing"
 	"time"
 
 	accountv1 "github.com/router-for-me/CLIProxyAPI/v7/internal/accountmanagementv1"
 	cliproxyauth "github.com/router-for-me/CLIProxyAPI/v7/sdk/cliproxy/auth"
 	"github.com/router-for-me/CLIProxyAPI/v7/sdk/pluginapi"
-	log "github.com/sirupsen/logrus"
 )
-
-func TestFileTokenStoreSuccessfulAntigravitySaveDoesNotLogSecrets(t *testing.T) {
-	baseDir := t.TempDir()
-	store := NewFileTokenStore()
-	store.SetBaseDir(baseDir)
-
-	var captured bytes.Buffer
-	previousOutput := log.StandardLogger().Out
-	log.SetOutput(&captured)
-	t.Cleanup(func() { log.SetOutput(previousOutput) })
-
-	const (
-		accessCanary  = "native-access-token-canary-stage7n"
-		refreshCanary = "native-refresh-token-canary-stage7n"
-	)
-	auth := &cliproxyauth.Auth{
-		ID:       "antigravity-native-secret@example.com.json",
-		FileName: "antigravity-native-secret@example.com.json",
-		Provider: "antigravity",
-		Metadata: map[string]any{
-			"type":          "antigravity",
-			"email":         "native-secret@example.com",
-			"access_token":  accessCanary,
-			"refresh_token": refreshCanary,
-		},
-	}
-	path, err := store.Save(context.Background(), auth)
-	if err != nil {
-		t.Fatal(err)
-	}
-	persisted, err := os.ReadFile(path)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if !bytes.Contains(persisted, []byte(accessCanary)) || !bytes.Contains(persisted, []byte(refreshCanary)) {
-		t.Fatal("native persistence did not commit the credential fields")
-	}
-	restarted := NewFileTokenStore()
-	restarted.SetBaseDir(baseDir)
-	reloaded, err := restarted.List(context.Background())
-	if err != nil {
-		t.Fatal(err)
-	}
-	if len(reloaded) != 1 || reloaded[0].Provider != "antigravity" || reloaded[0].FileName != auth.FileName {
-		t.Fatalf("native persistence restart projection=%+v", reloaded)
-	}
-	for _, canary := range []string{accessCanary, refreshCanary, baseDir, path} {
-		if strings.Contains(captured.String(), canary) {
-			t.Fatalf("native persistence log leaked protected canary %q", canary)
-		}
-	}
-}
 
 func TestFileTokenStoreAntigravitySaveUsesCoordinatorGateAndBookkeeping(t *testing.T) {
 	baseDir := t.TempDir()

@@ -21,13 +21,11 @@ import (
 	"sort"
 	"strings"
 	"sync"
-	"sync/atomic"
 	"time"
 )
 
 const (
 	SidecarDirectory        = ".relay-station-account-v1"
-	DispatchFenceDirectory  = "dispatch-fences"
 	MaxBackingFilenameBytes = 255
 	MaxCreateEmailBytes     = 238
 	MaxCredentialBytes      = 262144
@@ -53,9 +51,6 @@ var (
 	ErrTargetMetadata    = errors.New("target_metadata_unavailable")
 	ErrTargetChanged     = errors.New("auth_target_changed")
 	ErrTargetExists      = errors.New("auth_target_exists")
-	ErrInvalidDispatch   = errors.New("invalid dispatch token")
-	ErrDispatchFenced    = errors.New("mutation dispatch token already fenced")
-	ErrDispatchMetadata  = errors.New("dispatch fence metadata unavailable")
 )
 
 // Coordinator is the single per-AuthDir serialization and bookkeeping owner.
@@ -63,7 +58,6 @@ type Coordinator struct {
 	authDir string
 	gate    *Gate
 	books   *Bookkeeping
-	fences  *DispatchFenceStore
 }
 
 var coordinators = struct {
@@ -82,12 +76,7 @@ func ForAuthDir(authDir string) (*Coordinator, error) {
 	if c := coordinators.items[canonical]; c != nil {
 		return c, nil
 	}
-	c := &Coordinator{
-		authDir: canonical,
-		gate:    NewGate(),
-		books:   &Bookkeeping{authDir: canonical},
-		fences:  newDispatchFenceStore(canonical),
-	}
+	c := &Coordinator{authDir: canonical, gate: NewGate(), books: &Bookkeeping{authDir: canonical}}
 	coordinators.items[canonical] = c
 	return c, nil
 }
@@ -126,29 +115,10 @@ func (c *Coordinator) Bookkeeping() *Bookkeeping {
 	return c.books
 }
 
-// DispatchFences returns the durable dispatch-token fence store for this
-// AuthDir. Callers must hold the coordinator gate before checking or fencing a
-// token so that admission and recovery ordering remain one critical section.
-func (c *Coordinator) DispatchFences() *DispatchFenceStore {
-	if c == nil {
-		return nil
-	}
-	return c.fences
-}
-
 type gateTicket struct {
-	ready chan struct{}
-	state gateTicketState
-	lease *Lease
+	ready    chan struct{}
+	canceled bool
 }
-
-type gateTicketState uint8
-
-const (
-	ticketQueued gateTicketState = iota
-	ticketGranted
-	ticketCanceled
-)
 
 // Gate is a FIFO, cancelable, non-reentrant mutation gate.
 type Gate struct {
@@ -163,14 +133,11 @@ func NewGate() *Gate { return &Gate{} }
 // nested bookkeeping calls from self-deadlocking.
 type Lease struct {
 	gate     *Gate
-	released atomic.Bool
+	released bool
 }
 type heldKey struct{}
 
 func WithHeldLease(ctx context.Context, lease *Lease) context.Context {
-	if ctx == nil {
-		ctx = context.Background()
-	}
 	return context.WithValue(ctx, heldKey{}, lease)
 }
 
@@ -179,15 +146,7 @@ func HeldLease(ctx context.Context) *Lease {
 		return nil
 	}
 	lease, _ := ctx.Value(heldKey{}).(*Lease)
-	if lease == nil || lease.released.Load() {
-		return nil
-	}
-	return lease
-}
-
-func heldLeaseFor(g *Gate, ctx context.Context) *Lease {
-	lease := HeldLease(ctx)
-	if lease == nil || lease.gate != g {
+	if lease == nil || lease.released {
 		return nil
 	}
 	return lease
@@ -199,35 +158,24 @@ func (g *Gate) Acquire(ctx context.Context) (*Lease, error) {
 	if g == nil {
 		return nil, fmt.Errorf("nil mutation gate")
 	}
+	if HeldLease(ctx) != nil {
+		return HeldLease(ctx), nil
+	}
 	if ctx == nil {
 		ctx = context.Background()
 	}
-	if err := ctx.Err(); err != nil {
-		return nil, fmt.Errorf("%w: %v", ErrGateCanceled, err)
-	}
-	if lease := heldLeaseFor(g, ctx); lease != nil {
-		return lease, nil
-	}
-	t := &gateTicket{ready: make(chan struct{}), state: ticketQueued}
+	t := &gateTicket{ready: make(chan struct{})}
 	g.mu.Lock()
 	g.queue = append(g.queue, t)
 	g.promoteLocked()
 	g.mu.Unlock()
 	select {
 	case <-t.ready:
-		g.mu.Lock()
-		lease := t.lease
-		state := t.state
-		g.mu.Unlock()
-		if state != ticketGranted || lease == nil {
-			return nil, fmt.Errorf("mutation gate granted without lease")
-		}
-		return lease, nil
+		return &Lease{gate: g}, nil
 	case <-ctx.Done():
 		g.mu.Lock()
-		switch t.state {
-		case ticketQueued:
-			t.state = ticketCanceled
+		if !t.canceled {
+			t.canceled = true
 			for i, queued := range g.queue {
 				if queued == t {
 					g.queue = append(g.queue[:i], g.queue[i+1:]...)
@@ -235,40 +183,31 @@ func (g *Gate) Acquire(ctx context.Context) (*Lease, error) {
 				}
 			}
 			g.promoteLocked()
-			g.mu.Unlock()
-			return nil, fmt.Errorf("%w: %v", ErrGateCanceled, ctx.Err())
-		case ticketGranted:
-			// A grant that won the mutex race owns the gate even if the
-			// context became done before the select observed ready. Return
-			// that lease so the caller can release it; never strand held=true.
-			lease := t.lease
-			g.mu.Unlock()
-			return lease, nil
-		default:
-			g.mu.Unlock()
-			return nil, fmt.Errorf("%w: %v", ErrGateCanceled, ctx.Err())
 		}
+		g.mu.Unlock()
+		return nil, fmt.Errorf("%w: %v", ErrGateCanceled, ctx.Err())
 	}
 }
 
 func (g *Gate) promoteLocked() {
-	for !g.held && len(g.queue) > 0 {
-		t := g.queue[0]
-		g.queue = g.queue[1:]
-		if t.state == ticketCanceled {
-			continue
-		}
-		t.state = ticketGranted
-		t.lease = &Lease{gate: g}
-		g.held = true
-		close(t.ready)
+	if g.held || len(g.queue) == 0 {
+		return
 	}
+	t := g.queue[0]
+	g.queue = g.queue[1:]
+	if t.canceled {
+		g.promoteLocked()
+		return
+	}
+	g.held = true
+	close(t.ready)
 }
 
 func (l *Lease) Release() {
-	if l == nil || l.gate == nil || l.released.Swap(true) {
+	if l == nil || l.gate == nil || l.released {
 		return
 	}
+	l.released = true
 	g := l.gate
 	g.mu.Lock()
 	g.held = false
@@ -855,31 +794,24 @@ func decodeToken(token, prefix string, length int) ([]byte, error) {
 }
 
 func EncodeTargetPrecondition(state, provider, email, incarnation, filename, authIndex string, content []byte) (string, error) {
-	canonical, err := canonicalTargetPrecondition(state, provider, email, incarnation, filename, authIndex, content)
-	if err != nil {
-		return "", err
-	}
-	sum := sha256.Sum256(canonical)
-	return digestToken("pt1:", sum[:]), nil
-}
-
-func canonicalTargetPrecondition(state, provider, email, incarnation, filename, authIndex string, content []byte) ([]byte, error) {
 	var contentDigest []byte
 	if state == "present" {
 		sum := sha256.Sum256(content)
 		contentDigest = sum[:]
 		if !safeBasename(filename) {
-			return nil, ErrTargetMetadata
+			return "", ErrTargetMetadata
 		}
 	} else if state != "absent" {
-		return nil, fmt.Errorf("invalid target state")
+		return "", fmt.Errorf("invalid target state")
 	}
-	canonical := append([]byte(nil), []byte(pt1Domain)...)
+	var canonical []byte
+	canonical = fieldBytes(canonical, []byte(pt1Domain))
 	for _, v := range []string{state, strings.ToLower(strings.TrimSpace(provider)), normalizeEmail(email), incarnation, filename, authIndex} {
 		canonical = fieldBytes(canonical, []byte(v))
 	}
 	canonical = fieldBytes(canonical, contentDigest)
-	return canonical, nil
+	sum := sha256.Sum256(canonical)
+	return digestToken("pt1:", sum[:]), nil
 }
 func ValidateTargetPrecondition(token string) error {
 	b, err := decodeToken(token, "pt1:", 32)
@@ -908,27 +840,20 @@ func EncodeContentProof(raw []byte) (string, error) {
 }
 func ValidateContentProof(token string) error { _, err := decodeToken(token, "cs1:", 32); return err }
 func EncodePostcondition(incarnation, provider, email, filename string, content []byte, writeToken string) (string, error) {
-	canonical, err := canonicalPostcondition(incarnation, provider, email, filename, content, writeToken)
+	wt, err := decodeToken(writeToken, "wt1:", 16)
 	if err != nil {
 		return "", err
 	}
-	proof := sha256.Sum256(canonical)
-	return digestToken("pc1:", proof[:]), nil
-}
-
-func canonicalPostcondition(incarnation, provider, email, filename string, content []byte, writeToken string) ([]byte, error) {
-	wt, err := decodeToken(writeToken, "wt1:", 16)
-	if err != nil {
-		return nil, err
-	}
 	sum := sha256.Sum256(content)
-	canonical := append([]byte(nil), []byte(pc1Domain)...)
+	var canonical []byte
+	canonical = fieldBytes(canonical, []byte(pc1Domain))
 	for _, v := range []string{incarnation, strings.ToLower(strings.TrimSpace(provider)), normalizeEmail(email), filename} {
 		canonical = fieldBytes(canonical, []byte(v))
 	}
 	canonical = fieldBytes(canonical, sum[:])
 	canonical = fieldBytes(canonical, wt)
-	return canonical, nil
+	proof := sha256.Sum256(canonical)
+	return digestToken("pc1:", proof[:]), nil
 }
 func ValidatePostcondition(token string) error { _, err := decodeToken(token, "pc1:", 32); return err }
 

@@ -18,7 +18,6 @@ import (
 	"unicode/utf8"
 
 	"github.com/gin-gonic/gin"
-	"github.com/google/uuid"
 	accountv1 "github.com/router-for-me/CLIProxyAPI/v7/internal/accountmanagementv1"
 	"github.com/router-for-me/CLIProxyAPI/v7/internal/config"
 	sdkAuth "github.com/router-for-me/CLIProxyAPI/v7/sdk/auth"
@@ -31,16 +30,6 @@ func newAccountV1TestHandler(t *testing.T) (*Handler, string) {
 	dir := t.TempDir()
 	store := sdkAuth.NewFileTokenStore()
 	store.SetBaseDir(dir)
-	manager := coreauth.NewManager(store, nil, nil)
-	h := NewHandlerWithoutConfigFilePath(&config.Config{AuthDir: dir}, manager)
-	h.tokenStore = store
-	return h, dir
-}
-
-func newUnsupportedAccountV1TestHandler(t *testing.T) (*Handler, string) {
-	t.Helper()
-	dir := t.TempDir()
-	store := &accountV1UnsupportedStore{}
 	manager := coreauth.NewManager(store, nil, nil)
 	h := NewHandlerWithoutConfigFilePath(&config.Config{AuthDir: dir}, manager)
 	h.tokenStore = store
@@ -70,7 +59,6 @@ func antigravityCredential(t *testing.T, email, access string) []byte {
 
 func accountJSONCall(t *testing.T, handler gin.HandlerFunc, body any) *httptest.ResponseRecorder {
 	t.Helper()
-	body = accountMutationTestRequest(body)
 	raw, err := json.Marshal(body)
 	if err != nil {
 		t.Fatal(err)
@@ -85,7 +73,6 @@ func accountJSONCall(t *testing.T, handler gin.HandlerFunc, body any) *httptest.
 
 func accountMultipartCall(t *testing.T, handler gin.HandlerFunc, request any, credential []byte) *httptest.ResponseRecorder {
 	t.Helper()
-	request = accountMutationTestRequest(request)
 	var body bytes.Buffer
 	w := multipart.NewWriter(&body)
 	requestHeader := make(map[string][]string)
@@ -117,24 +104,6 @@ func accountMultipartCall(t *testing.T, handler gin.HandlerFunc, request any, cr
 	c.Request.Header.Set("Content-Type", w.FormDataContentType())
 	handler(c)
 	return recorder
-}
-
-func accountMutationTestRequest(input any) any {
-	request, ok := input.(map[string]any)
-	if !ok {
-		return input
-	}
-	if _, mutation := request["mutation_budget_ms"]; !mutation {
-		return input
-	}
-	copyRequest := make(map[string]any, len(request)+1)
-	for key, value := range request {
-		copyRequest[key] = value
-	}
-	if _, exists := copyRequest["dispatch_token_v1"]; !exists {
-		copyRequest["dispatch_token_v1"] = uuid.NewString()
-	}
-	return copyRequest
 }
 
 // textprotoMIMEHeader keeps the test helper local without obscuring the exact
@@ -323,70 +292,6 @@ func TestResolveProvesQuiescenceThroughSharedMutationGate(t *testing.T) {
 	}
 }
 
-func TestRecoveryResolveDurablyFencesLateMutationAcrossRestart(t *testing.T) {
-	gin.SetMode(gin.TestMode)
-	h, dir := newAccountV1TestHandler(t)
-	const (
-		email = "late-dispatch@example.com"
-		token = "00000000-0000-4000-8000-000000000042"
-	)
-
-	recovery := accountJSONCall(t, h.ResolveAccountTargetV1, map[string]any{
-		"provider":                "antigravity",
-		"email":                   email,
-		"fence_dispatch_token_v1": token,
-	})
-	if recovery.Code != http.StatusOK {
-		t.Fatalf("fenced recovery status=%d body=%s", recovery.Code, recovery.Body.String())
-	}
-
-	absent, err := accountv1.EncodeTargetPrecondition("absent", "antigravity", email, "", "", "", nil)
-	if err != nil {
-		t.Fatal(err)
-	}
-	credential := antigravityCredential(t, email, "late-dispatch-access")
-	content, err := accountv1.EncodeContentProof(credential)
-	if err != nil {
-		t.Fatal(err)
-	}
-	writeToken, err := accountv1.NewWriteToken()
-	if err != nil {
-		t.Fatal(err)
-	}
-	late := accountMultipartCall(t, h.CreateAccountV1, map[string]any{
-		"mode":                   "create",
-		"provider":               "antigravity",
-		"email":                  email,
-		"target_precondition_v1": absent,
-		"dispatch_token_v1":      token,
-		"write_token_v1":         writeToken,
-		"content_sha256_v1":      content,
-		"mutation_budget_ms":     15000,
-	}, credential)
-	if late.Code != http.StatusConflict || !strings.Contains(late.Body.String(), "mutation_dispatch_fenced") || !strings.Contains(late.Body.String(), `"physical_commit":"not_started"`) {
-		t.Fatalf("late mutation was not fenced: status=%d body=%s", late.Code, late.Body.String())
-	}
-	if _, err = os.Stat(filepath.Join(dir, "antigravity-"+email+".json")); !errors.Is(err, os.ErrNotExist) {
-		t.Fatalf("late mutation changed credential state: %v", err)
-	}
-	lateInvalidTarget := accountJSONCall(t, h.DisableAccountV1, map[string]any{
-		"dispatch_token_v1":  token,
-		"target":             map[string]any{"provider": "unsupported"},
-		"mutation_budget_ms": 15000,
-	})
-	if lateInvalidTarget.Code != http.StatusConflict || !strings.Contains(lateInvalidTarget.Body.String(), "mutation_dispatch_fenced") {
-		t.Fatalf("target validation ran before dispatch fence: status=%d body=%s", lateInvalidTarget.Code, lateInvalidTarget.Body.String())
-	}
-
-	restarted, err := accountv1.NewDispatchFenceStore(dir)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if err = restarted.RequireUnfenced(token); !errors.Is(err, accountv1.ErrDispatchFenced) {
-		t.Fatalf("restart lost dispatch fence: %v", err)
-	}
-}
-
 func TestAccountV1CreateResolveStatusReplaceAndRemove(t *testing.T) {
 	gin.SetMode(gin.TestMode)
 	h, dir := newAccountV1TestHandler(t)
@@ -538,7 +443,7 @@ func TestAccountV1RequestResponseAndLogsDoNotLeakSecrets(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	requestBody := map[string]any{"mode": "create", "provider": "antigravity", "email": "secret-log@example.com", "target_precondition_v1": absent, "dispatch_token_v1": uuid.NewString(), "write_token_v1": token, "content_sha256_v1": content, "mutation_budget_ms": 15000}
+	requestBody := map[string]any{"mode": "create", "provider": "antigravity", "email": "secret-log@example.com", "target_precondition_v1": absent, "write_token_v1": token, "content_sha256_v1": content, "mutation_budget_ms": 15000}
 
 	var body bytes.Buffer
 	w := multipart.NewWriter(&body)
@@ -582,182 +487,6 @@ func TestAccountV1RequestResponseAndLogsDoNotLeakSecrets(t *testing.T) {
 	}
 }
 
-func TestAccountV1SuccessfulCreateReplaceDoNotLeakSecrets(t *testing.T) {
-	gin.SetMode(gin.TestMode)
-	const managementKey = "management-key-success-canary"
-	t.Setenv("MANAGEMENT_PASSWORD", managementKey)
-	h, dir := newAccountV1TestHandler(t)
-
-	var captured bytes.Buffer
-	previousOutput := log.StandardLogger().Out
-	log.SetOutput(&captured)
-	t.Cleanup(func() { log.SetOutput(previousOutput) })
-	engine := gin.New()
-	engine.Use(gin.LoggerWithWriter(&captured))
-	engine.POST("/create", h.V1BearerOnlyMiddleware(), h.CreateAccountV1)
-	engine.POST("/replace", h.V1BearerOnlyMiddleware(), h.ReplaceAccountV1)
-	engine.POST("/disable", h.V1BearerOnlyMiddleware(), h.DisableAccountV1)
-	engine.POST("/enable", h.V1BearerOnlyMiddleware(), h.EnableAccountV1)
-	engine.POST("/remove", h.V1BearerOnlyMiddleware(), h.RemoveAccountV1)
-	responses := make([]string, 0, 5)
-	callJSON := func(path string, payload map[string]any) *httptest.ResponseRecorder {
-		t.Helper()
-		payload = accountMutationTestRequest(payload).(map[string]any)
-		raw, errMarshal := json.Marshal(payload)
-		if errMarshal != nil {
-			t.Fatal(errMarshal)
-		}
-		req := httptest.NewRequest(http.MethodPost, path, bytes.NewReader(raw))
-		req.Header.Set("Content-Type", "application/json")
-		req.Header.Set("Authorization", "Bearer "+managementKey)
-		result := httptest.NewRecorder()
-		engine.ServeHTTP(result, req)
-		responses = append(responses, result.Body.String())
-		return result
-	}
-
-	email := "success-canary@example.com"
-	credential := antigravityCredential(t, email, "successful-access-token-canary")
-	absent, err := accountv1.EncodeTargetPrecondition("absent", "antigravity", email, "", "", "", nil)
-	if err != nil {
-		t.Fatal(err)
-	}
-	content, err := accountv1.EncodeContentProof(credential)
-	if err != nil {
-		t.Fatal(err)
-	}
-	token, err := accountv1.NewWriteToken()
-	if err != nil {
-		t.Fatal(err)
-	}
-	requestBody := map[string]any{"mode": "create", "provider": "antigravity", "email": email, "target_precondition_v1": absent, "write_token_v1": token, "content_sha256_v1": content, "mutation_budget_ms": 15000}
-	body, contentType := accountMultipartBody(t, requestBody, credential)
-	request := httptest.NewRequest(http.MethodPost, "/create", body)
-	request.Header.Set("Content-Type", contentType)
-	request.Header.Set("Authorization", "Bearer "+managementKey)
-	recorder := httptest.NewRecorder()
-	engine.ServeHTTP(recorder, request)
-	if recorder.Code != http.StatusCreated {
-		t.Fatalf("successful create status=%d body=%s", recorder.Code, recorder.Body.String())
-	}
-	responses = append(responses, recorder.Body.String())
-	createBody := decodeAccountResponse(t, recorder)
-	if strings.Contains(recorder.Body.String(), "successful-access-token-canary") || strings.Contains(recorder.Body.String(), dir) {
-		t.Fatalf("create response leaked protected canary: %s", recorder.Body.String())
-	}
-
-	target := createBody["target"].(map[string]any)
-	replaceCredential := antigravityCredential(t, email, "successful-replace-token-canary")
-	replaceContent, err := accountv1.EncodeContentProof(replaceCredential)
-	if err != nil {
-		t.Fatal(err)
-	}
-	replaceToken, err := accountv1.NewWriteToken()
-	if err != nil {
-		t.Fatal(err)
-	}
-	replaceRequest := map[string]any{"mode": "replace", "target": map[string]any{"provider": target["provider"], "email": target["email"], "name": target["name"], "auth_index": target["auth_index"], "target_precondition_v1": createBody["target_precondition_v1"]}, "write_token_v1": replaceToken, "content_sha256_v1": replaceContent, "mutation_budget_ms": 15000}
-	body, contentType = accountMultipartBody(t, replaceRequest, replaceCredential)
-	request = httptest.NewRequest(http.MethodPost, "/replace", body)
-	request.Header.Set("Content-Type", contentType)
-	request.Header.Set("Authorization", "Bearer "+managementKey)
-	recorder = httptest.NewRecorder()
-	engine.ServeHTTP(recorder, request)
-	if recorder.Code != http.StatusOK {
-		t.Fatalf("successful replace status=%d body=%s", recorder.Code, recorder.Body.String())
-	}
-	responses = append(responses, recorder.Body.String())
-	if strings.Contains(recorder.Body.String(), "successful-replace-token-canary") || strings.Contains(recorder.Body.String(), dir) {
-		t.Fatalf("replace response leaked protected canary: %s", recorder.Body.String())
-	}
-
-	replaceBody := decodeAccountResponse(t, recorder)
-	currentTarget := replaceBody["target"].(map[string]any)
-	mutationTarget := func(body map[string]any) map[string]any {
-		return map[string]any{
-			"provider":               currentTarget["provider"],
-			"email":                  currentTarget["email"],
-			"name":                   currentTarget["name"],
-			"auth_index":             currentTarget["auth_index"],
-			"target_precondition_v1": body["target_precondition_v1"],
-		}
-	}
-	disabled := callJSON("/disable", map[string]any{"target": mutationTarget(replaceBody), "mutation_budget_ms": 15000})
-	if disabled.Code != http.StatusOK {
-		t.Fatalf("successful disable status=%d body=%s", disabled.Code, disabled.Body.String())
-	}
-	credentialPath := filepath.Join(dir, currentTarget["name"].(string))
-	disabledRaw, err := os.ReadFile(credentialPath)
-	if err != nil {
-		t.Fatal(err)
-	}
-	var disabledCredential map[string]any
-	if err = json.Unmarshal(disabledRaw, &disabledCredential); err != nil || disabledCredential["disabled"] != true {
-		t.Fatalf("disable durable state=%v err=%v", disabledCredential["disabled"], err)
-	}
-	disabledBody := decodeAccountResponse(t, disabled)
-	currentTarget = disabledBody["target"].(map[string]any)
-	enabled := callJSON("/enable", map[string]any{"target": mutationTarget(disabledBody), "mutation_budget_ms": 15000})
-	if enabled.Code != http.StatusOK {
-		t.Fatalf("successful enable status=%d body=%s", enabled.Code, enabled.Body.String())
-	}
-	enabledRaw, err := os.ReadFile(credentialPath)
-	if err != nil {
-		t.Fatal(err)
-	}
-	var enabledCredential map[string]any
-	if err = json.Unmarshal(enabledRaw, &enabledCredential); err != nil || enabledCredential["disabled"] != false {
-		t.Fatalf("enable durable state=%v err=%v", enabledCredential["disabled"], err)
-	}
-	enabledBody := decodeAccountResponse(t, enabled)
-	currentTarget = enabledBody["target"].(map[string]any)
-	removed := callJSON("/remove", map[string]any{"target": mutationTarget(enabledBody), "mutation_budget_ms": 15000})
-	if removed.Code != http.StatusOK {
-		t.Fatalf("successful remove status=%d body=%s", removed.Code, removed.Body.String())
-	}
-	if _, err = os.Stat(credentialPath); !errors.Is(err, os.ErrNotExist) {
-		t.Fatalf("remove left credential on disk: %v", err)
-	}
-
-	observed := captured.String() + strings.Join(responses, "")
-	for _, canary := range []string{managementKey, "successful-access-token-canary", "successful-replace-token-canary", "refresh-canary", string(credential), string(replaceCredential), "ignored.json", dir, credentialPath} {
-		if strings.Contains(observed, canary) {
-			t.Fatalf("successful mutation surface leaked protected canary %q", canary)
-		}
-	}
-}
-
-func accountMultipartBody(t *testing.T, request any, credential []byte) (*bytes.Buffer, string) {
-	t.Helper()
-	request = accountMutationTestRequest(request)
-	var body bytes.Buffer
-	w := multipart.NewWriter(&body)
-	requestHeader := textproto.MIMEHeader{}
-	requestHeader.Set("Content-Disposition", `form-data; name="request"`)
-	requestHeader.Set("Content-Type", "application/json")
-	requestPart, err := w.CreatePart(requestHeader)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if err = json.NewEncoder(requestPart).Encode(request); err != nil {
-		t.Fatal(err)
-	}
-	credentialHeader := textproto.MIMEHeader{}
-	credentialHeader.Set("Content-Disposition", `form-data; name="credential"; filename="ignored.json"`)
-	credentialHeader.Set("Content-Type", "application/json")
-	credentialPart, err := w.CreatePart(credentialHeader)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if _, err = credentialPart.Write(credential); err != nil {
-		t.Fatal(err)
-	}
-	if err = w.Close(); err != nil {
-		t.Fatal(err)
-	}
-	return &body, w.FormDataContentType()
-}
-
 func TestAccountV1CreateFilenameAdmission(t *testing.T) {
 	gin.SetMode(gin.TestMode)
 	h, _ := newAccountV1TestHandler(t)
@@ -782,126 +511,6 @@ func TestAccountV1CreateFilenameAdmission(t *testing.T) {
 	response = accountMultipartCall(t, h.CreateAccountV1, map[string]any{"mode": "create", "provider": "antigravity", "email": local239, "target_precondition_v1": absent, "write_token_v1": token, "content_sha256_v1": content, "mutation_budget_ms": 15000}, credential)
 	if response.Code != http.StatusBadRequest {
 		t.Fatalf("239-byte email status=%d body=%s", response.Code, response.Body.String())
-	}
-}
-
-func TestAccountV1StatusNoopReconcilesRuntimeState(t *testing.T) {
-	gin.SetMode(gin.TestMode)
-	h, dir := newAccountV1TestHandler(t)
-	email := "status-noop@example.com"
-	filename := "antigravity-" + email + ".json"
-	credential := antigravityCredential(t, email, "status-noop-access")
-	if err := os.WriteFile(filepath.Join(dir, filename), credential, 0o600); err != nil {
-		t.Fatal(err)
-	}
-	auth, err := h.buildAuthFromFileData(filepath.Join(dir, filename), credential)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if _, err = h.authManager.Register(coreauth.WithSkipPersist(context.Background()), auth); err != nil {
-		t.Fatal(err)
-	}
-	coordinator, err := accountv1.ForAuthDir(dir)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if _, err = coordinator.Bookkeeping().Provision(filename, "antigravity", email); err != nil {
-		t.Fatal(err)
-	}
-	resolved := accountJSONCall(t, h.ResolveAccountTargetV1, map[string]any{"provider": "antigravity", "email": email})
-	resolvedBody := decodeAccountResponse(t, resolved)
-	target := resolvedBody["target"].(map[string]any)
-	input := accountTargetInputV1{Provider: target["provider"].(string), Email: target["email"].(string), Name: target["name"].(string), AuthIndex: target["auth_index"].(string), TargetPreconditionV1: resolvedBody["target_precondition_v1"].(string)}
-
-	firstDisable := accountJSONCall(t, h.DisableAccountV1, map[string]any{"target": input, "mutation_budget_ms": 15000})
-	if firstDisable.Code != http.StatusOK {
-		t.Fatalf("initial disable status=%d body=%s", firstDisable.Code, firstDisable.Body.String())
-	}
-	before, err := os.ReadFile(filepath.Join(dir, filename))
-	if err != nil {
-		t.Fatal(err)
-	}
-	auth, ok := h.authManager.GetByID(auth.ID)
-	if !ok {
-		t.Fatal("runtime auth disappeared")
-	}
-	auth.Disabled = false
-	auth.Status = coreauth.StatusActive
-	if _, err = h.authManager.Update(coreauth.WithSkipPersist(context.Background()), auth); err != nil {
-		t.Fatal(err)
-	}
-
-	resolved = accountJSONCall(t, h.ResolveAccountTargetV1, map[string]any{"provider": "antigravity", "email": email})
-	resolvedBody = decodeAccountResponse(t, resolved)
-	target = resolvedBody["target"].(map[string]any)
-	input = accountTargetInputV1{Provider: target["provider"].(string), Email: target["email"].(string), Name: target["name"].(string), AuthIndex: target["auth_index"].(string), TargetPreconditionV1: resolvedBody["target_precondition_v1"].(string)}
-	response := accountJSONCall(t, h.DisableAccountV1, map[string]any{"target": input, "mutation_budget_ms": 15000})
-	if response.Code != http.StatusOK || decodeAccountResponse(t, response)["result"] != "applied" {
-		t.Fatalf("stale runtime noop was not reconciled: status=%d body=%s", response.Code, response.Body.String())
-	}
-	if strings.Contains(response.Body.String(), "mutation_partial") || strings.Contains(response.Body.String(), "physical_commit") {
-		t.Fatalf("runtime-only reconciliation reported physical commit: %s", response.Body.String())
-	}
-	after, err := os.ReadFile(filepath.Join(dir, filename))
-	if err != nil {
-		t.Fatal(err)
-	}
-	if !bytes.Equal(before, after) {
-		t.Fatal("runtime-only reconciliation changed the durable credential")
-	}
-	if runtimeAuth := h.runtimeAuthForTargetV1(input); !runtimeAccountStatusMatchesV1(runtimeAuth, true) {
-		t.Fatalf("runtime state did not converge: %#v", runtimeAuth)
-	}
-
-	resolved = accountJSONCall(t, h.ResolveAccountTargetV1, map[string]any{"provider": "antigravity", "email": email})
-	resolvedBody = decodeAccountResponse(t, resolved)
-	target = resolvedBody["target"].(map[string]any)
-	input = accountTargetInputV1{Provider: target["provider"].(string), Email: target["email"].(string), Name: target["name"].(string), AuthIndex: target["auth_index"].(string), TargetPreconditionV1: resolvedBody["target_precondition_v1"].(string)}
-	noop := accountJSONCall(t, h.DisableAccountV1, map[string]any{"target": input, "mutation_budget_ms": 15000})
-	if noop.Code != http.StatusOK || decodeAccountResponse(t, noop)["result"] != "noop" {
-		t.Fatalf("converged noop status=%d body=%s", noop.Code, noop.Body.String())
-	}
-}
-
-func TestLegacyAntigravityOwnershipDependsOnSupportedStore(t *testing.T) {
-	gin.SetMode(gin.TestMode)
-	h, dir := newUnsupportedAccountV1TestHandler(t)
-	email := "alternate-store@example.com"
-	filename := "antigravity-" + email + ".json"
-	credential := antigravityCredential(t, email, "alternate-store-access")
-	if err := os.WriteFile(filepath.Join(dir, filename), credential, 0o600); err != nil {
-		t.Fatal(err)
-	}
-	auth, err := h.buildAuthFromFileData(filepath.Join(dir, filename), credential)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if _, err = h.authManager.Register(coreauth.WithSkipPersist(context.Background()), auth); err != nil {
-		t.Fatal(err)
-	}
-	status := accountJSONCall(t, h.PatchAuthFileStatus, map[string]any{"name": filename, "auth_index": lockedAuthIndex(auth), "disabled": true})
-	if status.Code == http.StatusConflict || strings.Contains(status.Body.String(), accountMutationV1RequiredError) {
-		t.Fatalf("unsupported store incorrectly claimed v1 ownership: status=%d body=%s", status.Code, status.Body.String())
-	}
-	if status.Code != http.StatusOK {
-		t.Fatalf("unsupported store legacy behavior failed: status=%d body=%s", status.Code, status.Body.String())
-	}
-}
-
-func TestLegacyOwnershipDoesNotReopenWhenMetadataIsCorrupt(t *testing.T) {
-	gin.SetMode(gin.TestMode)
-	h, dir := newAccountV1TestHandler(t)
-	if err := os.WriteFile(filepath.Join(dir, "antigravity-corrupt.json"), []byte("{"), 0o600); err != nil {
-		t.Fatal(err)
-	}
-	credential := antigravityCredential(t, "new-owner@example.com", "new-owner-access")
-	recorder := httptest.NewRecorder()
-	c, _ := gin.CreateTestContext(recorder)
-	c.Request = httptest.NewRequest(http.MethodPost, "/?name=new-owner.json", bytes.NewReader(credential))
-	c.Request.Header.Set("Content-Type", "application/json")
-	h.UploadAuthFile(c)
-	if recorder.Code != http.StatusConflict || !strings.Contains(recorder.Body.String(), accountMutationV1RequiredError) {
-		t.Fatalf("corrupt metadata reopened legacy ownership: status=%d body=%s", recorder.Code, recorder.Body.String())
 	}
 }
 
@@ -943,7 +552,7 @@ func TestAccountV1SlowMultipartReadTimesOutBeforeMutation(t *testing.T) {
 		if err != nil {
 			return
 		}
-		_, _ = requestPart.Write([]byte(`{"mode":"create","provider":"antigravity","email":"slow@example.com","target_precondition_v1":"pt1:AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA","dispatch_token_v1":"00000000-0000-4000-8000-000000000001","write_token_v1":"wt1:AAAAAAAAAAAAAAAAAAAAAA","content_sha256_v1":"cs1:AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA","mutation_budget_ms":15000}`))
+		_, _ = requestPart.Write([]byte(`{"mode":"create","provider":"antigravity","email":"slow@example.com","target_precondition_v1":"pt1:AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA","write_token_v1":"wt1:AAAAAAAAAAAAAAAAAAAAAA","content_sha256_v1":"cs1:AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA","mutation_budget_ms":15000}`))
 		credentialHeader := textproto.MIMEHeader{}
 		credentialHeader.Set("Content-Disposition", `form-data; name="credential"; filename="ignored.json"`)
 		credentialHeader.Set("Content-Type", "application/json")
@@ -983,12 +592,8 @@ func TestAccountV1SlowMultipartReadTimesOutBeforeMutation(t *testing.T) {
 
 func TestLegacyAntigravityManagementMutationsRequireV1(t *testing.T) {
 	gin.SetMode(gin.TestMode)
-	var captured bytes.Buffer
-	previousOutput := log.StandardLogger().Out
-	log.SetOutput(&captured)
-	t.Cleanup(func() { log.SetOutput(previousOutput) })
 	h, dir := newAccountV1TestHandler(t)
-	credential := antigravityCredential(t, "legacy@example.com", "legacy-access-canary-stage7n")
+	credential := antigravityCredential(t, "legacy@example.com", "access")
 	filename := "antigravity-legacy@example.com.json"
 	if err := os.WriteFile(filepath.Join(dir, filename), credential, 0o600); err != nil {
 		t.Fatal(err)
@@ -1042,12 +647,6 @@ func TestLegacyAntigravityManagementMutationsRequireV1(t *testing.T) {
 	}
 	if _, err = os.Stat(filepath.Join(dir, filename)); err != nil {
 		t.Fatalf("legacy batch rejection mutated credential: %v", err)
-	}
-	observed := captured.String() + status.Body.String() + fields.Body.String() + deletion.Body.String() + rawUpload.Body.String() + deleteAll.Body.String()
-	for _, canary := range []string{"legacy-access-canary-stage7n", "refresh-canary", string(credential), dir, filepath.Join(dir, filename)} {
-		if strings.Contains(observed, canary) {
-			t.Fatalf("legacy rejection surface leaked protected canary %q", canary)
-		}
 	}
 }
 

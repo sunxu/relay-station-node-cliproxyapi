@@ -120,7 +120,6 @@ type accountMutationInputV1 struct {
 	Email                string               `json:"email,omitempty"`
 	Target               accountTargetInputV1 `json:"target,omitempty"`
 	TargetPreconditionV1 string               `json:"target_precondition_v1,omitempty"`
-	DispatchTokenV1      string               `json:"dispatch_token_v1"`
 	WriteTokenV1         string               `json:"write_token_v1,omitempty"`
 	ContentSHA256V1      string               `json:"content_sha256_v1,omitempty"`
 	MutationBudgetMS     int                  `json:"mutation_budget_ms"`
@@ -177,15 +176,6 @@ func (h *Handler) accountV1StoreSupported() bool {
 	return ok
 }
 
-// accountMutationV1OwnershipActive is the single legacy-mutation ownership
-// boundary. It intentionally does not inspect sidecar health: a corrupt or
-// temporarily unavailable v1 metadata set must not reopen unsafe legacy
-// Antigravity writers. Unsupported stores remain outside v1 ownership and
-// retain their native legacy behavior.
-func (h *Handler) accountMutationV1OwnershipActive() bool {
-	return h != nil && h.cfg != nil && strings.TrimSpace(h.cfg.AuthDir) != "" && h.authManager != nil && h.accountV1StoreSupported()
-}
-
 func decodeAccountJSONV1(c *gin.Context, out any, limit int64, started time.Time) error {
 	if c == nil || c.ContentType() != "application/json" {
 		return errors.New("content type must be application/json")
@@ -239,9 +229,8 @@ func (h *Handler) ResolveAccountTargetV1(c *gin.Context) {
 	defer cancel()
 	defer lease.Release()
 	var request struct {
-		Provider             string `json:"provider"`
-		Email                string `json:"email"`
-		FenceDispatchTokenV1 string `json:"fence_dispatch_token_v1,omitempty"`
+		Provider string `json:"provider"`
+		Email    string `json:"email"`
 	}
 	if err := decodeAccountJSONV1(c, &request, 32*1024, started); err != nil {
 		if accountReadTimedOut(started, err) {
@@ -256,16 +245,6 @@ func (h *Handler) ResolveAccountTargetV1(c *gin.Context) {
 	if provider != "antigravity" || email == "" {
 		writeAccountV1Error(c, http.StatusBadRequest, "unsupported_provider", "provider is not supported")
 		return
-	}
-	if request.FenceDispatchTokenV1 != "" {
-		if err := accountv1.ValidateDispatchToken(request.FenceDispatchTokenV1); err != nil {
-			writeAccountV1Error(c, http.StatusBadRequest, "invalid_request", "invalid dispatch fence token")
-			return
-		}
-		if err := coordinator.DispatchFences().Fence(request.FenceDispatchTokenV1); err != nil {
-			writeAccountV1Error(c, http.StatusServiceUnavailable, "target_metadata_unavailable", "dispatch fence could not be persisted")
-			return
-		}
 	}
 	targets, err := accountv1.ScanTargets(coordinator.AuthDir(), coordinator.Bookkeeping())
 	if err != nil {
@@ -348,28 +327,6 @@ func (h *Handler) resolvedAccountV1(coordinator *accountv1.Coordinator, target a
 func (h *Handler) DisableAccountV1(c *gin.Context) { h.mutateAccountStatusV1(c, true) }
 func (h *Handler) EnableAccountV1(c *gin.Context)  { h.mutateAccountStatusV1(c, false) }
 
-func validateMutationDispatchV1(c *gin.Context, coordinator *accountv1.Coordinator, lease *accountv1.Lease, token string) bool {
-	if accountv1.ValidateDispatchToken(token) != nil {
-		writeAccountV1Error(c, http.StatusBadRequest, "invalid_request", "invalid dispatch token")
-		return false
-	}
-	if err := coordinator.DispatchFences().RequireUnfenced(token); err != nil {
-		if errors.Is(err, accountv1.ErrDispatchFenced) {
-			lease.Release()
-			c.Header("Cache-Control", "no-store")
-			c.JSON(http.StatusConflict, gin.H{
-				"error":           accountV1Error{Code: "mutation_dispatch_fenced", Message: "this mutation dispatch is durably fenced"},
-				"quiescent":       true,
-				"physical_commit": "not_started",
-			})
-			return false
-		}
-		writeAccountV1Error(c, http.StatusServiceUnavailable, "target_metadata_unavailable", "dispatch fence metadata is unavailable")
-		return false
-	}
-	return true
-}
-
 func (h *Handler) mutateAccountStatusV1(c *gin.Context, disabled bool) {
 	started := time.Now()
 	coordinator, lease, ctx, cancel, ok := h.acquireAccountV1(c, started, accountv1.MaxMutationDuration)
@@ -386,9 +343,6 @@ func (h *Handler) mutateAccountStatusV1(c *gin.Context, disabled bool) {
 			return
 		}
 		writeAccountV1Error(c, http.StatusBadRequest, "invalid_request", "invalid mutation request")
-		return
-	}
-	if !validateMutationDispatchV1(c, coordinator, lease, request.DispatchTokenV1) {
 		return
 	}
 	if request.MutationBudgetMS < 1 || request.MutationBudgetMS > accountMaxMutationDurationMS {
@@ -411,18 +365,9 @@ func (h *Handler) mutateAccountStatusV1(c *gin.Context, disabled bool) {
 	}
 	current, _ := metadata["disabled"].(bool)
 	if current == disabled {
-		result := "noop"
-		if runtimeChanged, errRuntime := h.reconcileRuntimeStatusV1(ctx, path, raw, request.Target, disabled); errRuntime != nil {
-			lease.Release()
-			writeAccountV1Error(c, http.StatusServiceUnavailable, "manager_unavailable", "runtime account state could not be reconciled")
-			return
-		} else if runtimeChanged {
-			result = "applied"
-		}
-		response, responseOK := h.buildCurrentMutationResponseV1(coordinator, request.Target, result, nil)
+		response, responseOK := h.buildCurrentMutationResponseV1(coordinator, request.Target, "noop", nil)
 		if !responseOK {
-			lease.Release()
-			writeAccountV1Error(c, http.StatusServiceUnavailable, "target_metadata_unavailable", "target metadata is unavailable")
+			h.writePartialAccountV1(c, coordinator, request.Target, lease)
 			return
 		}
 		lease.Release()
@@ -470,55 +415,6 @@ func (h *Handler) mutateAccountStatusV1(c *gin.Context, disabled bool) {
 	c.JSON(http.StatusOK, response)
 }
 
-func (h *Handler) runtimeAuthForTargetV1(input accountTargetInputV1) *coreauth.Auth {
-	if h == nil || h.authManager == nil {
-		return nil
-	}
-	provider, email := normalizeAccountIdentity(input.Provider, input.Email)
-	for _, auth := range h.authManager.List() {
-		if auth == nil || !strings.EqualFold(strings.TrimSpace(auth.Provider), provider) || !strings.EqualFold(strings.TrimSpace(auth.FileName), strings.TrimSpace(input.Name)) {
-			continue
-		}
-		value, _ := auth.Metadata["email"].(string)
-		if !strings.EqualFold(strings.TrimSpace(value), email) || lockedAuthIndex(auth) != strings.TrimSpace(input.AuthIndex) {
-			continue
-		}
-		return auth
-	}
-	return nil
-}
-
-func runtimeAccountStatusMatchesV1(auth *coreauth.Auth, disabled bool) bool {
-	if auth == nil || auth.Disabled != disabled {
-		return false
-	}
-	if disabled {
-		return auth.Status == coreauth.StatusDisabled
-	}
-	return auth.Status != coreauth.StatusDisabled
-}
-
-// reconcileRuntimeStatusV1 returns true when runtime state had to change. It
-// is used only after the durable file already has the requested value, so any
-// failure here is pre-commit and must never be reported as mutation_partial.
-func (h *Handler) reconcileRuntimeStatusV1(ctx context.Context, path string, raw []byte, input accountTargetInputV1, disabled bool) (bool, error) {
-	if runtimeAccountStatusMatchesV1(h.runtimeAuthForTargetV1(input), disabled) {
-		return false, nil
-	}
-	auth, err := h.buildAuthFromFileData(path, raw)
-	if err != nil {
-		return false, err
-	}
-	applyAuthDisabledState(auth, disabled)
-	if err = h.upsertAuthRecord(coreauth.WithSkipPersist(ctx), auth); err != nil {
-		return false, err
-	}
-	if !runtimeAccountStatusMatchesV1(h.runtimeAuthForTargetV1(input), disabled) {
-		return false, errors.New("runtime account state did not converge")
-	}
-	return true, nil
-}
-
 func (h *Handler) RemoveAccountV1(c *gin.Context) {
 	started := time.Now()
 	coordinator, lease, ctx, cancel, ok := h.acquireAccountV1(c, started, accountv1.MaxMutationDuration)
@@ -535,9 +431,6 @@ func (h *Handler) RemoveAccountV1(c *gin.Context) {
 			return
 		}
 		writeAccountV1Error(c, http.StatusBadRequest, "invalid_request", "invalid mutation request")
-		return
-	}
-	if !validateMutationDispatchV1(c, coordinator, lease, request.DispatchTokenV1) {
 		return
 	}
 	if request.MutationBudgetMS < 1 || request.MutationBudgetMS > accountMaxMutationDurationMS {
@@ -597,9 +490,6 @@ func (h *Handler) mutateUploadedAccountV1(c *gin.Context, create bool) {
 		} else {
 			writeAccountV1Error(c, http.StatusBadRequest, "invalid_request", "invalid multipart request")
 		}
-		return
-	}
-	if !validateMutationDispatchV1(c, coordinator, lease, request.DispatchTokenV1) {
 		return
 	}
 	if request.MutationBudgetMS < 1 || request.MutationBudgetMS > accountMaxMutationDurationMS || accountv1.ValidateWriteToken(request.WriteTokenV1) != nil || accountv1.ValidateContentProof(request.ContentSHA256V1) != nil {
